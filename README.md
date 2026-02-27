@@ -52,8 +52,3 @@ Extracts the images from `mini_images.zip`.
 Uses ResNet18 to generate image embeddings.
 These embeddings are saved to your Google Drive and do not need to be generated again.
 
----
-
-## ✅ After Completion
-
-If everything runs successfully, embeddings will be saved inside:
