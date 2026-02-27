@@ -1,0 +1,264 @@
+# =========================
+# 1) MOUNT GOOGLE DRIVE
+# =========================
+from google.colab import drive
+drive.mount('/content/drive')
+
+
+
+
+
+# =========================
+# 2) CHECK FILES + COPY TO /content
+# =========================
+import os
+
+# -------- CHANGE_ME: where you placed the files in Google Drive --------
+DRIVE_DIR = "/content/drive/MyDrive"  # CHANGE_ME if your files are inside a subfolder
+
+TRAIN_CSV_DRIVE = os.path.join(DRIVE_DIR, "mini_train.csv")   # CHANGE_ME filename if different
+TEST_CSV_DRIVE  = os.path.join(DRIVE_DIR, "mini_test.csv")    # CHANGE_ME filename if different
+IMAGES_ZIP_DRIVE = os.path.join(DRIVE_DIR, "mini_images.zip") # CHANGE_ME filename if different
+
+# ---- Verify they exist ----
+for p in [TRAIN_CSV_DRIVE, TEST_CSV_DRIVE, IMAGES_ZIP_DRIVE]:
+    if not os.path.exists(p):
+        raise FileNotFoundError(f"❌ File not found in Drive: {p}\n"
+                                f"👉 Fix DRIVE_DIR / filenames (CHANGE_ME lines).")
+
+print("✅ Found files in Drive.")
+
+# ---- Copy into Colab runtime (/content) ----
+!cp "{TRAIN_CSV_DRIVE}" /content/mini_train.csv
+!cp "{TEST_CSV_DRIVE}"  /content/mini_test.csv
+!cp "{IMAGES_ZIP_DRIVE}" /content/mini_images.zip
+
+
+
+
+
+
+# =========================
+# 3) UNZIP IMAGES + SET IMAGES_DIR
+# =========================
+import os
+
+ZIP_PATH = "/content/mini_images.zip"
+UNZIP_TO = "/content"  # keep simple
+
+if not os.path.exists(ZIP_PATH):
+    raise FileNotFoundError(f"❌ Missing {ZIP_PATH}. Run the copy cell first.")
+
+!unzip -q "{ZIP_PATH}" -d "{UNZIP_TO}"
+
+# ---- Auto-detect likely image folder ----
+CANDIDATES = [
+    "/content/mini_images",
+    "/content/content/mini_images",  # your notebook had this pattern
+    "/content/images",
+]
+
+IMAGES_DIR = None
+for c in CANDIDATES:
+    if os.path.isdir(c):
+        IMAGES_DIR = c
+        break
+
+# If still not found, search shallow for a folder named mini_images
+if IMAGES_DIR is None:
+    for root, dirs, files in os.walk("/content"):
+        if os.path.basename(root) == "mini_images":
+            IMAGES_DIR = root
+            break
+
+if IMAGES_DIR is None:
+    raise FileNotFoundError(
+        "❌ Could not find the extracted image folder.\n"
+        "👉 After unzip, run: !find /content -maxdepth 3 -type d | head\n"
+        "and set IMAGES_DIR manually."
+    )
+
+print("✅ IMAGES_DIR =", IMAGES_DIR)
+!ls -lh "{IMAGES_DIR}" | head
+
+
+
+
+
+
+# =========================
+# 4) IMAGE EMBEDDINGS (ResNet18) + PROGRESS + CACHE TO DRIVE
+# =========================
+import os
+import numpy as np
+import pandas as pd
+
+# -------- CHANGE_ME: input CSV paths (if you renamed them) --------
+TRAIN_CSV = "/content/mini_train.csv"  # CHANGE_ME if needed
+TEST_CSV  = "/content/mini_test.csv"   # CHANGE_ME if needed
+
+# -------- CHANGE_ME: embeddings cache folder in Drive --------
+SAVE_DIR = "/content/drive/MyDrive/embeddings_cache"  # CHANGE_ME if you want a subfolder
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+TRAIN_EMB_PATH = os.path.join(SAVE_DIR, "train_img_emb.npy")
+TEST_EMB_PATH  = os.path.join(SAVE_DIR, "test_img_emb.npy")
+
+# -------- Load CSVs --------
+train_df = pd.read_csv(TRAIN_CSV)
+test_df  = pd.read_csv(TEST_CSV)
+
+# ✅ IMPORTANT ASSUMPTION:
+# This assumes each image filename corresponds to sample_id (e.g., 123.jpg / 123.jpeg / 123.png).
+# If your dataset uses a different naming scheme, adjust the "resolve_image_path" function below.
+
+# ---- Install + imports ----
+!pip -q install torch torchvision
+
+import torch
+from torchvision import models, transforms
+from PIL import Image
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print("✅ device:", device)
+
+def build_resnet18_embedder():
+    """
+    Returns:
+      model: outputs a 512-d embedding (ResNet18 avgpool output flattened)
+      preprocess: torchvision transform
+    """
+    weights = models.ResNet18_Weights.DEFAULT
+    backbone = models.resnet18(weights=weights)
+    backbone.fc = torch.nn.Identity()  # remove classifier head => 512-d features
+    backbone.eval().to(device)
+
+    preprocess = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=weights.transforms().mean, std=weights.transforms().std),
+    ])
+    return backbone, preprocess
+
+def index_images(images_dir):
+    """
+    Build a lookup dict from file-stem -> full path.
+    Example: '123' -> '/content/.../123.jpg'
+    """
+    exts = {".jpg", ".jpeg", ".png", ".webp"}
+    mapping = {}
+    for root, _, files in os.walk(images_dir):
+        for fn in files:
+            ext = os.path.splitext(fn)[1].lower()
+            if ext in exts:
+                stem = os.path.splitext(fn)[0]
+                if stem not in mapping:  # keep first match
+                    mapping[stem] = os.path.join(root, fn)
+    return mapping
+
+def extract_embeddings(sample_ids, model, preprocess, images_dir, batch_size=64, log_every=200):
+    """
+    Extract embeddings in the same order as sample_ids.
+    Shows progress % and count completed.
+    Returns:
+      emb: (N, 512) float32
+      missing: number of missing images
+    """
+    id2path = index_images(images_dir)
+
+    N = len(sample_ids)
+    emb_list = []
+    missing = 0
+
+    batch_imgs = []
+    batch_indices = []
+
+    def flush_batch():
+        nonlocal batch_imgs, batch_indices, emb_list
+        if not batch_imgs:
+            return
+        x = torch.stack(batch_imgs).to(device)
+        with torch.no_grad():
+            feats = model(x).detach().cpu().numpy().astype(np.float32)  # (B, 512)
+        # Place in output order
+        for f in feats:
+            emb_list.append(f)
+        batch_imgs = []
+        batch_indices = []
+
+    model.eval()
+    for i, sid in enumerate(sample_ids, start=1):
+        sid_str = str(sid)
+        img_path = id2path.get(sid_str)
+
+        if img_path is None:
+            missing += 1
+            # put a zero-vector so shapes stay consistent
+            emb_list.append(np.zeros((512,), dtype=np.float32))
+        else:
+            try:
+                img = Image.open(img_path).convert("RGB")
+                tensor = preprocess(img)
+                batch_imgs.append(tensor)
+                batch_indices.append(i)
+                if len(batch_imgs) >= batch_size:
+                    flush_batch()
+            except Exception:
+                missing += 1
+                emb_list.append(np.zeros((512,), dtype=np.float32))
+
+        if (i % log_every == 0) or (i == N):
+            pct = (i / N) * 100
+            print(f"🧠 Embedding progress: {i}/{N} ({pct:.2f}%) | missing so far: {missing}")
+
+    flush_batch()
+    emb = np.vstack(emb_list).astype(np.float32)
+    return emb, missing
+
+# ---- Load-or-extract ----
+if os.path.exists(TRAIN_EMB_PATH) and os.path.exists(TEST_EMB_PATH):
+    print("🔁 Loading saved embeddings from Drive...")
+    train_img_emb = np.load(TRAIN_EMB_PATH)
+    test_img_emb  = np.load(TEST_EMB_PATH)
+    print("✅ Loaded.")
+else:
+    # -------- CHANGE_ME: IMAGES_DIR must be set from the unzip cell --------
+    # If you're running this cell alone, set IMAGES_DIR manually here.
+    # Example: IMAGES_DIR = "/content/mini_images"
+    try:
+        IMAGES_DIR
+    except NameError:
+        IMAGES_DIR = "/content/mini_images"  # CHANGE_ME if needed
+
+    if not os.path.isdir(IMAGES_DIR):
+        raise FileNotFoundError(f"❌ IMAGES_DIR not found: {IMAGES_DIR}\n"
+                                "👉 Run the unzip cell or fix IMAGES_DIR (CHANGE_ME).")
+
+    print("🚀 Extracting embeddings (first time only)...")
+    model_img, preprocess_img = build_resnet18_embedder()
+
+    train_img_emb, miss_train = extract_embeddings(
+        train_df["sample_id"].values, model_img, preprocess_img, IMAGES_DIR
+    )
+    test_img_emb, miss_test = extract_embeddings(
+        test_df["sample_id"].values, model_img, preprocess_img, IMAGES_DIR
+    )
+
+    print(f"Missing images → train: {miss_train}, test: {miss_test}")
+
+    print("💾 Saving embeddings to Drive...")
+    np.save(TRAIN_EMB_PATH, train_img_emb)
+    np.save(TEST_EMB_PATH, test_img_emb)
+    print("✅ Saved embeddings to Drive.")
+
+print("train_img_emb shape:", train_img_emb.shape)
+print("test_img_emb shape :", test_img_emb.shape)
+
+# ---- Alignment sanity checks ----
+assert len(train_img_emb) == len(train_df), "❌ Train embeddings count != train rows"
+assert len(test_img_emb) == len(test_df), "❌ Test embeddings count != test rows"
+print("✅ Embeddings aligned with CSV rows.")
+
+!ls -lh /content | sed -n '1,120p'
+print("✅ Copied into /content.")
